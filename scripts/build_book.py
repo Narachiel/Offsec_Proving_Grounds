@@ -116,15 +116,49 @@ def build_book():
 
     print(f'Found {len(pdfs)} PDFs to include')
 
-    # compute page offsets (include one title page per document)
-    readers = []
-    offsets = []
-    total = 0
-    for p in pdfs:
+    # First, create modified versions of each PDF with header overlay (or prepended header fallback).
+    modified_files = []  # list of (orig_path, modified_path, page_count)
+    for idx, p in enumerate(pdfs):
         r = PdfReader(str(p))
-        readers.append((p, r))
-        offsets.append(total + 1)  # 1-based start page in merged document
-        total += len(r.pages) + 1  # include title page for each document
+        title = p.stem
+        header_path = TEMP_DIR / f'header_{idx}.pdf'
+        tmp_modified = TEMP_DIR / f'mod_{idx}.pdf'
+        make_header_overlay(title, header_path)
+
+        writer = PdfWriter()
+        overlay_reader = PdfReader(str(header_path))
+        overlay_page = overlay_reader.pages[0]
+        try:
+            # attempt to merge overlay onto first page
+            first = r.pages[0]
+            try:
+                first.merge_page(overlay_page)
+                writer.add_page(first)
+                for i in range(1, len(r.pages)):
+                    writer.add_page(r.pages[i])
+            except Exception:
+                # fallback: prepend overlay as its own page
+                writer.add_page(overlay_page)
+                for pg in r.pages:
+                    writer.add_page(pg)
+        except Exception:
+            # if anything unexpected, just copy original
+            for pg in r.pages:
+                writer.add_page(pg)
+
+        with open(tmp_modified, 'wb') as fh:
+            writer.write(fh)
+
+        # read back to get page count
+        mod_reader = PdfReader(str(tmp_modified))
+        modified_files.append((p, tmp_modified, len(mod_reader.pages)))
+
+    # compute page offsets from modified files
+    total = 0
+    offsets = []
+    for orig, mod, count in modified_files:
+        offsets.append(total + 1)
+        total += count
 
     # Create cover
     cover_path = TEMP_DIR / 'cover.pdf'
@@ -134,24 +168,18 @@ def build_book():
     # We'll assume cover is 1 page; TOC may be multiple pages; compute TOC after we know its length.
     # To get TOC length we construct a preliminary TOC and measure pages.
 
-    # Build preliminary merger to compute TOC start pages: cover (1) + toc (unknown) + content
-    # For simplicity, we'll generate the TOC with page numbers offset by 1 + toc_pages (we'll iterate if needed).
-
-    # First guess: TOC fits in 2 pages. We'll generate and then re-create if page counts shift.
+    # Build preliminary TOC based on modified_files and iterate until TOC page count stabilizes.
     toc_path = TEMP_DIR / 'toc.pdf'
-
-    # Compute initial start pages assuming cover=1 and toc_pages=1
     toc_pages = 1
     while True:
         merged_offset = 1 + toc_pages  # cover=1
         entries = []
-        for idx, (p, r) in enumerate(readers):
-            display = p.relative_to(REPO_ROOT).as_posix()
+        for idx, (orig, mod, count) in enumerate(modified_files):
+            display = orig.relative_to(REPO_ROOT).as_posix()
             start_page = merged_offset + offsets[idx] - 1
             entries.append((display, start_page))
 
         make_toc(entries, toc_path)
-        # measure toc pages
         toc_reader = PdfReader(str(toc_path))
         new_toc_pages = len(toc_reader.pages)
         if new_toc_pages == toc_pages:
@@ -162,37 +190,9 @@ def build_book():
     merger = PdfMerger()
     merger.append(str(cover_path))
     merger.append(str(toc_path))
-    tmp_files = []
-    for idx, (p, r) in enumerate(readers):
-        title = p.stem
-        header_path = TEMP_DIR / f'header_{idx}.pdf'
-        tmp_modified = TEMP_DIR / f'mod_{idx}.pdf'
-        make_header_overlay(title, header_path)
-
-        writer = PdfWriter()
-        try:
-            first = r.pages[0]
-            overlay = PdfReader(str(header_path)).pages[0]
-            try:
-                first.merge_page(overlay)
-                writer.add_page(first)
-                for i in range(1, len(r.pages)):
-                    writer.add_page(r.pages[i])
-            except Exception:
-                # fallback: prepend overlay page then original pages
-                writer.add_page(overlay)
-                writer.add_page(first)
-                for i in range(1, len(r.pages)):
-                    writer.add_page(r.pages[i])
-        except Exception:
-            # if anything goes wrong, append original PDF
-            merger.append(str(p))
-            continue
-
-        with open(tmp_modified, 'wb') as fh:
-            writer.write(fh)
-        tmp_files.append(tmp_modified)
-        merger.append(str(tmp_modified))
+    # Append modified PDFs in order
+    for orig, mod, count in modified_files:
+        merger.append(str(mod))
 
     # write merged to a temp merged file first
     merged_tmp = TEMP_DIR / 'merged_tmp.pdf'
