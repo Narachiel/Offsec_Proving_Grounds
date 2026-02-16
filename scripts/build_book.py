@@ -8,7 +8,7 @@ from pathlib import Path
 from datetime import datetime
 
 try:
-    from PyPDF2 import PdfReader, PdfMerger
+    from PyPDF2 import PdfReader, PdfMerger, PdfWriter
 except Exception:
     raise
 
@@ -16,6 +16,7 @@ try:
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     from reportlab.lib.units import mm
+    from reportlab.lib import colors
 except Exception:
     raise
 
@@ -97,13 +98,12 @@ def make_toc(entries, out_path: Path):
     c.save()
 
 
-def make_title_page(title: str, out_path: Path):
+def make_header_overlay(title: str, out_path: Path):
     c = canvas.Canvas(str(out_path), pagesize=A4)
     w, h = A4
-    # Use header-sized title (not oversized)
-    c.setFont('Helvetica-Bold', 20)
-    # position like a header
-    c.drawCentredString(w / 2, h - 40 * mm, title)
+    c.setFillColor(colors.red)
+    c.setFont('Helvetica-Bold', 16)
+    c.drawCentredString(w / 2, h - 20 * mm, title)
     c.showPage()
     c.save()
 
@@ -158,19 +158,72 @@ def build_book():
             break
         toc_pages = new_toc_pages
 
-    # Now merge: cover, toc, then for each pdf add a title page then the content
+    # Now merge: cover, toc, then for each pdf overlay header onto its first page
     merger = PdfMerger()
     merger.append(str(cover_path))
     merger.append(str(toc_path))
-    for idx, (p, _) in enumerate(readers):
+    tmp_files = []
+    for idx, (p, r) in enumerate(readers):
         title = p.stem
-        title_path = TEMP_DIR / f'title_{idx}.pdf'
-        make_title_page(title, title_path)
-        merger.append(str(title_path))
-        merger.append(str(p))
+        header_path = TEMP_DIR / f'header_{idx}.pdf'
+        tmp_modified = TEMP_DIR / f'mod_{idx}.pdf'
+        make_header_overlay(title, header_path)
 
-    merger.write(str(OUT_FILE))
+        writer = PdfWriter()
+        try:
+            first = r.pages[0]
+            overlay = PdfReader(str(header_path)).pages[0]
+            try:
+                first.merge_page(overlay)
+                writer.add_page(first)
+                for i in range(1, len(r.pages)):
+                    writer.add_page(r.pages[i])
+            except Exception:
+                # fallback: prepend overlay page then original pages
+                writer.add_page(overlay)
+                writer.add_page(first)
+                for i in range(1, len(r.pages)):
+                    writer.add_page(r.pages[i])
+        except Exception:
+            # if anything goes wrong, append original PDF
+            merger.append(str(p))
+            continue
+
+        with open(tmp_modified, 'wb') as fh:
+            writer.write(fh)
+        tmp_files.append(tmp_modified)
+        merger.append(str(tmp_modified))
+
+    # write merged to a temp merged file first
+    merged_tmp = TEMP_DIR / 'merged_tmp.pdf'
+    merger.write(str(merged_tmp))
     merger.close()
+
+    # Add page numbers as footer on every page
+    merged_reader = PdfReader(str(merged_tmp))
+    writer = PdfWriter()
+    for i, page in enumerate(merged_reader.pages, start=1):
+        # create footer overlay
+        footer_path = TEMP_DIR / f'footer_{i}.pdf'
+        c = canvas.Canvas(str(footer_path), pagesize=A4)
+        w, h = A4
+        c.setFont('Helvetica', 9)
+        c.setFillColor(colors.grey)
+        c.drawCentredString(w / 2, 10 * mm, str(i))
+        c.showPage()
+        c.save()
+
+        footer_reader = PdfReader(str(footer_path))
+        try:
+            page.merge_page(footer_reader.pages[0])
+        except Exception:
+            pass
+        writer.add_page(page)
+
+    # ensure output directory exists
+    OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(OUT_FILE, 'wb') as fh:
+        writer.write(fh)
 
     print(f'Created book: {OUT_FILE}')
     return 0
